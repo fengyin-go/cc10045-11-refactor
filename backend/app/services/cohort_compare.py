@@ -37,6 +37,20 @@ class CohortCompareService(BaseModuleService):
 
         result = compute_cohort_comparison(entry)
 
+        if not result.get("ok", True):
+            # 重算清空态没有已确认成员，不能把临时成员当确认的群出结果；
+            # 对比状态落为计算失败，错误摘要一并留档供复核。
+            db.update("cohort_comparisons", {
+                "status": "计算失败",
+                "result_summary": result["result_summary"],
+            }, "id=?", [entry_id])
+            return {
+                "ok": False,
+                "message": result.get("message", "分群成员尚未确认，无法对比"),
+                "comparison_name": result["comparison_name"],
+                "status": "计算失败",
+            }
+
         db.update("cohort_comparisons", {
             "status": "已完成",
             "result_summary": result["result_summary"],

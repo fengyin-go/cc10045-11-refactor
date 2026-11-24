@@ -19,6 +19,7 @@ class Store:
         tables = self._db.table_names()
         business_tables = [t for t in tables if not t.startswith("_") and t not in
                           ("aggregation_results", "metric_values", "segment_members",
+                           "segment_member_staging",
                            "funnel_results", "retention_results", "cube_cells",
                            "forecast_results", "report_outputs", "alert_log")]
         return sorted(business_tables)

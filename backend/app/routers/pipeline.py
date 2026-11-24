@@ -1,7 +1,7 @@
 """数据分析管道路由：事件采集、聚合执行、指标快照、分群计算等核心操作入口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.database import db
 from app.pipeline import (
@@ -66,6 +66,28 @@ def api_compute_segment(segment_id: int) -> dict:
     return svc.run_computation(segment_id)
 
 
+@router.get("/segments/{segment_id}/members")
+def api_segment_members(segment_id: int, page: int = 1, size: int = 50) -> dict:
+    """列出分群已确认成员，供核对重叠时实际使用的集合。"""
+    svc = service_for("segment_engine")
+    items, total = svc.list_members(segment_id, page=page, size=size)
+    return {"items": items, "total": total, "page": page, "size": size}
+
+
+@router.get("/segments/{segment_id}/attributes")
+def api_segment_attributes(segment_id: int) -> dict:
+    """汇总分群成员属性分布。"""
+    svc = service_for("segment_engine")
+    return svc.attribute_summary(segment_id)
+
+
+@router.get("/segments/overlap")
+def api_segment_overlap(a: int, b: int) -> dict:
+    """核对两个分群的成员重叠度，并返回本次使用的成员集合依据。"""
+    svc = service_for("segment_engine")
+    return svc.member_overlap(a, b)
+
+
 @router.post("/funnels/{funnel_id}/compute")
 def api_compute_funnel(funnel_id: int) -> dict:
     """对指定漏斗执行分析计算。"""
@@ -92,6 +114,16 @@ def api_compute_comparison(comparison_id: int) -> dict:
     """对指定分群对比执行计算。"""
     svc = service_for("cohort_compare")
     return svc.run_comparison(comparison_id)
+
+
+@router.get("/comparison/{comparison_id}")
+def api_comparison_result(comparison_id: int) -> dict:
+    """回查对比结果，含本次实际使用的两组成员数据与逐属性样本明细。"""
+    svc = service_for("cohort_compare")
+    result = svc.comparison_result(comparison_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"对比记录 {comparison_id} 不存在")
+    return result
 
 
 @router.post("/cube/{cube_id}/precompute")

@@ -5,11 +5,11 @@
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from app.database import db
 from app.pipeline import compute_segment
+from app.segment_store import fetch_segment_member_snapshots, snapshot_for
 from app.services.base import BaseModuleService
 
 
@@ -39,20 +39,35 @@ class SegmentEngineService(BaseModuleService):
         }
 
     def list_members(self, segment_id: int, page: int = 1, size: int = 50) -> tuple[list[dict[str, Any]], int]:
-        """列出分群成员。"""
-        total = db.count("segment_members", "segment_id=?", [segment_id])
+        """列出分群成员。
+
+        只列已确认版本：成员与分群当前 ``member_version`` 一致才算数，
+        重算暂存区和旧版残留不会混进列表。
+        """
+        where = (
+            "segment_id=? AND member_version="
+            "(SELECT member_version FROM segments WHERE id=?)"
+        )
+        params = [segment_id, segment_id]
+        total = db.count("segment_members", where, params)
         rows = db.fetchall(
-            "SELECT * FROM segment_members WHERE segment_id=? LIMIT ? OFFSET ?",
-            [segment_id, size, (page - 1) * size],
+            f"SELECT * FROM segment_members WHERE {where} ORDER BY id LIMIT ? OFFSET ?",
+            params + [size, (page - 1) * size],
         )
         return rows, total
 
     def member_overlap(self, segment_id_a: int, segment_id_b: int) -> dict[str, Any]:
-        """计算两个分群的成员重叠度。"""
-        members_a = {r["member_key"] for r in db.fetchall(
-            "SELECT member_key FROM segment_members WHERE segment_id=?", [segment_id_a])}
-        members_b = {r["member_key"] for r in db.fetchall(
-            "SELECT member_key FROM segment_members WHERE segment_id=?", [segment_id_b])}
+        """计算两个分群的成员重叠度。
+
+        成员走共用取数：只用已确认的完整成员集合，重算中的暂存成员不参与，
+        重算清空态不与“确实为零成员”混同。输出字段与原有口径保持不变。
+        """
+        snapshots = fetch_segment_member_snapshots([segment_id_a, segment_id_b])
+        snap_a = snapshots.get(int(segment_id_a)) or snapshot_for(segment_id_a)
+        snap_b = snapshots.get(int(segment_id_b)) or snapshot_for(segment_id_b)
+
+        members_a = snap_a.member_keys
+        members_b = snap_b.member_keys
 
         intersection = members_a & members_b
         union = members_a | members_b
@@ -67,26 +82,30 @@ class SegmentEngineService(BaseModuleService):
             "jaccard_similarity": jaccard,
             "overlap_rate_a": overlap_a,
             "overlap_rate_b": overlap_b,
+            "overlap_members": sorted(intersection),
+            "sample_basis": {
+                "segment_a": snap_a.audit(),
+                "segment_b": snap_b.audit(),
+            },
         }
 
     def attribute_summary(self, segment_id: int) -> dict[str, Any]:
         """汇总分群成员的属性分布。"""
-        rows = db.fetchall(
-            "SELECT member_attrs FROM segment_members WHERE segment_id=?", [segment_id])
+        snapshot = fetch_segment_member_snapshots([segment_id])[int(segment_id)]
+        rows = snapshot.members
         if not rows:
             return {"count": 0, "attributes": {}}
 
         from collections import Counter
         attr_counts: dict[str, Counter[str]] = {}
         for r in rows:
-            try:
-                attrs = json.loads(r["member_attrs"]) if isinstance(r["member_attrs"], str) else r.get("member_attrs", {})
-                for k, v in attrs.items():
-                    if k not in attr_counts:
-                        attr_counts[k] = Counter()
-                    attr_counts[k][str(v)] += 1
-            except (json.JSONDecodeError, TypeError):
-                pass
+            attrs = r.attrs
+            if attrs is None:
+                continue
+            for k, v in attrs.items():
+                if k not in attr_counts:
+                    attr_counts[k] = Counter()
+                attr_counts[k][str(v)] += 1
 
         return {
             "count": len(rows),

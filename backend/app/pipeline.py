@@ -30,6 +30,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.database import db
+from app.segment_store import (
+    STATE_RECOMPUTING_EMPTY,
+    SegmentMember,
+    fetch_segment_member_snapshots,
+    snapshot_for,
+)
 
 
 # ============================================================================
@@ -332,6 +338,12 @@ def compute_segment(segment: dict[str, Any]) -> int:
 
     解析 conditions JSON，从 events 表匹配符合条件的记录，去重后写入。
     返回匹配的成员数。
+
+    写入分两步：先把本次结果写进 ``segment_member_staging``，全部写完后
+    在一个事务里整体替换已发布的 ``segment_members`` 并递增 ``member_version``。
+    这样重算过程中读取方始终能看到上一次已确认的完整成员集合，
+    而不是只写入一部分的临时集合；读不到已发布成员时也能凭分群状态
+    区分“重算清空”和“确实零成员”。
     """
     segment_id = segment["id"]
     conditions_raw = segment.get("条件" if "条件" in segment else "分群条件", segment.get("conditions", "{}"))
@@ -340,9 +352,6 @@ def compute_segment(segment: dict[str, Any]) -> int:
         conditions = json.loads(conditions_raw) if isinstance(conditions_raw, str) else conditions_raw
     except (json.JSONDecodeError, TypeError):
         conditions = {}
-
-    # 清除旧成员
-    db.delete("segment_members", "segment_id=?", [segment_id])
 
     # 构建查询条件
     where_parts = ["1=1"]
@@ -374,7 +383,12 @@ def compute_segment(segment: dict[str, Any]) -> int:
     where_clause = " AND ".join(where_parts)
     events = db.fetchall(f"SELECT * FROM events WHERE {where_clause}", params)
 
-    # 去重写入
+    current = db.fetchone("SELECT member_version FROM segments WHERE id=?", [segment_id])
+    next_version = int((current or {}).get("member_version") or 0) + 1
+
+    # 清掉上一次未发布完的暂存，重新写入本次结果
+    db.delete("segment_member_staging", "segment_id=?", [segment_id])
+
     seen_keys: set[str] = set()
     members_added = 0
     for evt in events:
@@ -387,19 +401,36 @@ def compute_segment(segment: dict[str, Any]) -> int:
         if member_key in seen_keys:
             continue
         seen_keys.add(member_key)
-        db.insert("segment_members", {
+        db.insert("segment_member_staging", {
             "segment_id": segment_id,
             "member_key": str(member_key),
             "member_attrs": json.dumps(attrs, ensure_ascii=False),
+            "member_version": next_version,
         })
         members_added += 1
 
-    # 更新分群元数据
-    db.update("segments", {
-        "estimated_size": members_added,
-        "last_computed_at": db.now(),
-        "status": "已生成",
-    }, "id=?", [segment_id])
+    # 原子发布：旧版本成员整批下线，暂存结果整批上线，版本号一起切换
+    with db.tx() as conn:
+        conn.execute("DELETE FROM segment_members WHERE segment_id=?", (segment_id,))
+        conn.execute(
+            """
+            INSERT INTO segment_members (segment_id, member_key, member_attrs, member_version)
+            SELECT segment_id, member_key, member_attrs, member_version
+            FROM segment_member_staging
+            WHERE segment_id=?
+            ORDER BY id
+            """,
+            (segment_id,),
+        )
+        conn.execute("DELETE FROM segment_member_staging WHERE segment_id=?", (segment_id,))
+        conn.execute(
+            """
+            UPDATE segments
+               SET estimated_size=?, last_computed_at=?, status='已生成', member_version=?
+             WHERE id=?
+            """,
+            (members_added, db.now(), next_version, segment_id),
+        )
 
     return members_added
 
@@ -760,6 +791,11 @@ def compute_cohort_comparison(comparison: dict[str, Any]) -> dict[str, Any]:
 
     计算每个对比维度下两分群的均值差异、方差和显著性，
     使用 Welch's t-test 近似判断差异显著性。
+
+    两组成员统一走 ``segment_store`` 共用取数：只使用已确认的完整成员集合，
+    并在同一次取数中锁定成员编号、属性与计算版。结果里同时留下本次实际
+    使用的两组成员明细，以及每个属性实际纳入的样本数和被过滤成员的编号与
+    原因，便于复核既有统计口径。
     """
     seg_a_id = comparison.get("分群A", comparison.get("segment_a_id"))
     seg_b_id = comparison.get("分群B", comparison.get("segment_b_id"))
@@ -770,15 +806,48 @@ def compute_cohort_comparison(comparison: dict[str, Any]) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         dims = []
 
-    members_a = db.fetchall("SELECT * FROM segment_members WHERE segment_id=?", [seg_a_id])
-    members_b = db.fetchall("SELECT * FROM segment_members WHERE segment_id=?", [seg_b_id])
+    snapshots = fetch_segment_member_snapshots([seg_a_id, seg_b_id])
+    snap_a = snapshots.get(_as_int(seg_a_id)) or snapshot_for(seg_a_id)
+    snap_b = snapshots.get(_as_int(seg_b_id)) or snapshot_for(seg_b_id)
+
+    # 重算清空态没有任何已确认成员；暂存区里可能只有写入了一半的临时成员，
+    # 绝不能把它当成确认的群来出差异结果。
+    for snapshot, segment_id in ((snap_a, seg_a_id), (snap_b, seg_b_id)):
+        if snapshot.state == STATE_RECOMPUTING_EMPTY:
+            return {
+                "comparison_name": comparison.get("对比名称", comparison.get("comparison_name", "")),
+                "dimension_results": [],
+                "significant_count": 0,
+                "result_summary": json.dumps({
+                    "total_dimensions": len(dims),
+                    "significant_count": 0,
+                    "dimensions": [],
+                    "error": "segment_recomputing",
+                    "message": f"分群 {segment_id} 正在重算且尚无已确认成员，不使用临时成员参与对比",
+                }, ensure_ascii=False),
+                "status": "计算失败",
+                "ok": False,
+                "message": f"分群 {segment_id} 正在重算且尚无已确认成员，不使用临时成员参与对比",
+            }
+
+    members_a = list(snap_a.members)
+    members_b = list(snap_b.members)
 
     dimension_results: list[dict[str, Any]] = []
     significant_count = 0
 
     for dim in dims:
-        vals_a = _extract_dim_values(members_a, dim)
-        vals_b = _extract_dim_values(members_b, dim)
+        vals_a, included_a, filtered_a = _collect_dim_values(members_a, dim)
+        vals_b, included_b, filtered_b = _collect_dim_values(members_b, dim)
+
+        sample_audit = {
+            "sample_size_a": len(vals_a),
+            "sample_size_b": len(vals_b),
+            "included_members_a": included_a,
+            "included_members_b": included_b,
+            "filtered_members_a": filtered_a,
+            "filtered_members_b": filtered_b,
+        }
 
         if not vals_a or not vals_b:
             dimension_results.append({
@@ -787,6 +856,7 @@ def compute_cohort_comparison(comparison: dict[str, Any]) -> dict[str, Any]:
                 "std_a": 0, "std_b": 0,
                 "diff_pct": 0,
                 "significant": False,
+                **sample_audit,
             })
             continue
 
@@ -816,12 +886,18 @@ def compute_cohort_comparison(comparison: dict[str, Any]) -> dict[str, Any]:
             "diff_pct": diff_pct,
             "t_stat": round(t_stat, 4) if se > 0 else 0,
             "significant": significant,
+            **sample_audit,
         })
 
     result_summary = json.dumps({
         "total_dimensions": len(dims),
         "significant_count": significant_count,
         "dimensions": dimension_results,
+        # 本次实际使用的两组成员数据，产出后仍可回查原采样
+        "samples": {
+            "segment_a": snap_a.audit(include_attrs=True),
+            "segment_b": snap_b.audit(include_attrs=True),
+        },
     }, ensure_ascii=False)
 
     return {
@@ -830,21 +906,53 @@ def compute_cohort_comparison(comparison: dict[str, Any]) -> dict[str, Any]:
         "significant_count": significant_count,
         "result_summary": result_summary,
         "status": "已完成",
+        "ok": True,
     }
 
 
-def _extract_dim_values(members: list[dict[str, Any]], dim: str) -> list[float]:
-    """从分群成员属性中提取维度值列表。"""
-    result: list[float] = []
-    for m in members:
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_dim_values(
+    members: list[SegmentMember], dim: str,
+) -> tuple[list[float], list[str], list[dict[str, Any]]]:
+    """提取维度值，同时记录实际纳入的成员和被过滤成员的原因。
+
+    与原有口径一致：属性值为 0 也计入样本；缺失值和非数值被过滤。
+    """
+    values: list[float] = []
+    included: list[str] = []
+    filtered: list[dict[str, Any]] = []
+    for member in members:
+        if member.attrs is None:
+            filtered.append({"member_key": member.member_key, "reason": "unparseable_attrs"})
+            continue
+        if dim not in member.attrs:
+            filtered.append({"member_key": member.member_key, "reason": "missing_attribute"})
+            continue
+        raw_value = member.attrs.get(dim)
+        if raw_value is None:
+            filtered.append({
+                "member_key": member.member_key,
+                "reason": "missing_attribute",
+                "value": raw_value,
+            })
+            continue
         try:
-            attrs = json.loads(m.get("member_attrs", "{}")) if isinstance(m.get("member_attrs"), str) else m.get("member_attrs", {})
-            val = attrs.get(dim)
-            if val is not None:
-                result.append(float(val))
-        except (ValueError, TypeError, json.JSONDecodeError):
-            pass
-    return result
+            values.append(float(raw_value))
+        except (ValueError, TypeError):
+            filtered.append({
+                "member_key": member.member_key,
+                "reason": "unparseable_value",
+                "value": raw_value,
+            })
+            continue
+        included.append(member.member_key)
+    return values, included, filtered
 
 
 # ============================================================================

@@ -104,6 +104,7 @@ DDL_STATEMENTS = [
         estimated_size INTEGER DEFAULT 0,
         status TEXT NOT NULL DEFAULT '草稿',
         last_computed_at TEXT,
+        member_version INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
 
@@ -112,11 +113,26 @@ DDL_STATEMENTS = [
         segment_id INTEGER NOT NULL,
         member_key TEXT NOT NULL,
         member_attrs TEXT DEFAULT '{}',
+        member_version INTEGER NOT NULL DEFAULT 0,
         assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (segment_id) REFERENCES segments(id)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_sm_segment ON segment_members(segment_id)",
     "CREATE INDEX IF NOT EXISTS idx_sm_member ON segment_members(member_key)",
+
+    # 重算暂存区：分群重算期间的新成员先写这里，全部写完后再原子发布到
+    # segment_members。已发布的 segment_members 始终是完整的已确认集合，
+    # 这样重算中途读取方不会看到残缺成员，也能和“确认零成员”区分开。
+    """CREATE TABLE IF NOT EXISTS segment_member_staging (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        segment_id INTEGER NOT NULL,
+        member_key TEXT NOT NULL,
+        member_attrs TEXT DEFAULT '{}',
+        member_version INTEGER NOT NULL DEFAULT 0,
+        staged_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (segment_id) REFERENCES segments(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_sms_segment ON segment_member_staging(segment_id)",
 
     # ==================== Funnel Tier ====================
     """CREATE TABLE IF NOT EXISTS funnels (
@@ -373,8 +389,19 @@ class AnalyticsDB:
         conn.execute("PRAGMA busy_timeout=5000")
         for stmt in DDL_STATEMENTS:
             conn.execute(stmt)
+        # 旧库补列：member_version 用于区分同一分群的成员计算版，
+        # 保证成员编号和属性始终来自同一版。
+        self._ensure_column(conn, "segments", "member_version", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "segment_members", "member_version", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "segment_member_staging", "member_version", "INTEGER NOT NULL DEFAULT 0")
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     @classmethod
     def get(cls) -> AnalyticsDB:
